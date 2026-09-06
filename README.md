@@ -41,6 +41,7 @@ A workflow that runs without errors isn't the same as a workflow that behaves co
 5. Update the system prompt in the Groq node with your own property categories and business context so classification reflects your actual use case.
 6. Activate the workflow.
 
-## About
+## Demo
 
-Built by **Muhammad Sami Ullah**, an AI and workflow automation specialist for real estate and property teams, building n8n based automation systems that remove manual busywork from property inboxes.
+[See it in action](https://drive.google.com/file/d/1ncUy836bMkG5UT5hvdGan1PlDKcwAKPA/view?usp=sharing)
+
