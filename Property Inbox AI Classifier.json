@@ -1,0 +1,984 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "options": {
+          "trackLastMessageId": true
+        }
+      },
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2.1,
+      "position": [
+        -1264,
+        1232
+      ],
+      "id": "",
+      "name": "Email Trigger (IMAP)",
+      "retryOnFail": false,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = items[0];\n\nconst rawBody = item.json.textPlain || item.json.textHtml || \"\";\nconst cleanBody = rawBody.replace(/\\s+/g, ' ').trim();\nconst truncatedBody = cleanBody.length > 500 ? cleanBody.substring(0, 500) + \"...\" : cleanBody;\n\nreturn {\n  json: {\n    ...item.json,\n    original_body: truncatedBody\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1072,
+        1232
+      ],
+      "id": "",
+      "name": "Sanitize Email Body"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "groqApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n\"model\": \"qwen/qwen3.6-27b\",\n  \"reasoning_effort\": \"none\",\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are an AI email classification and response engine for a property management and real estate operations team.\\n\\nAnalyze the incoming email and return ONLY a valid JSON object. Do not include any markdown formatting, code blocks, or conversational text before or after the JSON. The JSON must contain exactly four keys:\\n\\n1. 'category': Must be EXACTLY one of these five strings, with this exact spelling and capitalization: 'Maintenance', 'Tenant Query', 'Viewing', 'Enquiry', 'Spam'.\\n   - 'Maintenance': repairs, urgent property issues, faults (heating, plumbing, appliances, lockouts).\\n   - 'Tenant Query': lease questions, rent/payment queries, complaints, general tenant/client communication.\\n   - 'Viewing': requests to book, reschedule, or cancel a property viewing/appointment.\\n   - 'Enquiry': new prospective enquiries about property availability, pricing, details, OR any short, vague, unclear, or minimal-content message (greetings, test messages, single words, incomplete sentences) that does not clearly fit another category.\\n   - 'Spam': unwanted, promotional, or malicious emails, AND automated platform alerts, newsletters, or receipts that do not require a human reply.\\n\\n   IMPORTANT: Always choose one of these five exact strings. Never return a category based on the literal words in the email (for example, do not return the word 'hi' as a category just because the email says 'hi'). If the email is too short or unclear to confidently classify, default to 'Enquiry', not any other value.\\n\\n2. 'urgency': An integer from 1 (lowest) to 5 (highest). Maintenance issues involving safety (no heating, water leak, lockout, gas smell) must be urgency 4-5. Spam must always be urgency 1. Vague or short messages default to urgency 2.\\n\\n3. 'property_reference': Extract any property address, unit number, or reference mentioned in the email. If none is found, return an empty string. Never return null and never omit this key.\\n\\n4. 'suggested_reply': A professional, polite, contextual email response addressing the message. Keep it under 150 words. If the email is too vague to respond to meaningfully, write a brief friendly reply asking the sender to share more details about their property enquiry, maintenance issue, or query.\\n\\nCRITICAL RULES:\\n- Output ONLY the JSON object. No preamble, no explanation, no markdown.\\n- All four keys must always be present with correctly typed values.\\n- If the category is 'Spam', set suggested_reply to 'N/A' and do not generate a draft reply.\\n- Never invent a fifth category and never leave category blank.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Email Details:\\nSubject: {{ $json.subject || 'No Subject' }}\\n\\nBody: {{ $('Sanitize Email Body').item.json.original_body || 'Empty Body' }}\"\n    }\n  ],\n  \"response_format\": { \"type\": \"json_object\" },\n  \"temperature\": 0\n}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -864,
+        1232
+      ],
+      "id": "",
+      "name": "Classify Ticket via Groq",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "let parsedData = {};\ntry {\n  const item = items[0];\n  const rawContent = item.json.choices[0].message.content;\n  parsedData = JSON.parse(rawContent);\n} catch (error) {\n  parsedData = {\n    category: \"manual_review\",\n    urgency: 3,\n    property_reference: \"\",\n    suggested_reply: \"Dear Customer,\\n\\nWe have received your request and our team is reviewing it.\\n\\nBest regards,\\nProperty Support Team\",\n    parsing_error: true\n  };\n}\n\n// ---------- Map numeric urgency (1-5) to Airtable-compatible text label ----------\nconst urgencyMap = {\n  1: 'Low',\n  2: 'Low',\n  3: 'Medium',\n  4: 'High',\n  5: 'Critical'\n};\nconst urgencyLabel = urgencyMap[parsedData.urgency] || 'Medium';\n\n// Validate the category returned by the AI\nconst validCategories = [\"Maintenance\", \"Tenant Query\", \"Viewing\", \"Enquiry\", \"Spam\"];\nconst finalCategory = validCategories.includes(parsedData.category) ? parsedData.category : \"manual_review\";\n\n// Clear the reply text for Spam only\nconst finalReply = (finalCategory === \"Spam\")\n  ? \"N/A \u2014 No reply generated for spam.\"\n  : (parsedData.suggested_reply || \"Thank you for reaching out. We are looking into your issue.\");\n\n// ---------- Extract sender details (correct method + strong regex) ----------\nlet rawSender = \"unknown@domain.com\";\ntry {\n  // Use $('...') instead of $node for reliable node referencing\n  const imapNode = $('Email Trigger (IMAP)').item.json;\n  if (imapNode.from?.value?.[0]?.address) {\n    const fromData = imapNode.from.value[0];\n    rawSender = fromData.name ? `${fromData.name} <${fromData.address}>` : fromData.address;\n  } else if (imapNode.from?.address) {\n    rawSender = imapNode.from.address;\n  } else if (typeof imapNode.from === 'string') {\n    rawSender = imapNode.from;\n  }\n} catch (e) {\n  // If anything fails here, keep the default fallback value\n}\n\nlet cleanEmail = \"unknown@domain.com\";\nlet cleanName = \"Unknown\";\n\n// Case with angle brackets: \"Name <email>\"\nconst angleBracketMatch = rawSender.match(/(.*?)\\s*<([^>]+)>/);\nif (angleBracketMatch) {\n  cleanName = angleBracketMatch[1].replace(/[\"']/g, \"\").trim() || \"Unknown\";\n  cleanEmail = angleBracketMatch[2].trim().toLowerCase();\n} else {\n  // Strong regex \u2014 extracts only a valid email address\n  const emailRegex = /\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Z|a-z]{2,}\\b/;\n  const match = rawSender.match(emailRegex);\n  if (match) {\n    cleanEmail = match[0].trim().toLowerCase();\n  }\n}\n\n// Get original subject and body\nlet originalSubject = \"No Subject\";\nlet originalBody = \"Empty Body\";\ntry {\n  originalSubject = $('Email Trigger (IMAP)').item.json.subject || \"No Subject\";\n  originalBody = $('Sanitize Email Body').item.json.original_body || \"Empty Body\";\n} catch(e) {}\n\n// ---------- FINAL OUTPUT ----------\nreturn {\n  json: {\n    category: finalCategory,\n    urgency: urgencyLabel,  // Now \"Low\"/\"Medium\"/\"High\"/\"Critical\" \u2014 ready for Airtable\n    property_reference: parsedData.property_reference || \"\",\n    suggested_reply: finalReply,\n    original_subject: originalSubject,\n    original_body: originalBody,\n    sender_name: cleanName,\n    sender_email: cleanEmail\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -512,
+        1216
+      ],
+      "id": "",
+      "name": "Parse Classification & Sender",
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const errorItem = items[0];\nconst errorMsg = errorItem.json.error || errorItem.json.message || \"Unknown API error\";\n\n// Convert the error into a manual_review item so the workflow does not stop\nreturn [{\n  json: {\n    category: \"manual_review\",\n    urgency: \"Medium\",\n    property_reference: \"\",\n    suggested_reply: `System error: ${errorMsg}. Please handle manually.`,\n    original_subject: errorItem.json.original_subject || \"Error Subject\",\n    original_body: errorItem.json.original_body || \"Error Body\",\n    sender_name: \"System Alert\",\n    sender_email: \"alert@system.local\",\n    error_alert: errorMsg\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -656,
+        1248
+      ],
+      "id": "",
+      "name": "Handle Classification Error"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.category }}",
+                    "rightValue": "Maintenance",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": ""
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Maintenance"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "",
+                    "leftValue": "={{ $json.category }}",
+                    "rightValue": "Tenant Query",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Tenant Query"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "",
+                    "leftValue": "={{ $json.category }}",
+                    "rightValue": "Viewing",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Viewing"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "",
+                    "leftValue": "={{ $json.category }}",
+                    "rightValue": "Enquiry",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Enquiry"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "",
+                    "leftValue": "={{ $json.category }}",
+                    "rightValue": "Spam",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Spam"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        -288,
+        1136
+      ],
+      "id": "",
+      "name": "Switch"
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list",
+          "cachedResultName": "maintenance"
+        },
+        "text": "=\ud83d\udd27 *New Maintenance Request \u2014 Action Required*\n\n\ud83d\udc64 *Tenant/Client Name:* {{ $('Switch').item.json.sender_name }}\n\ud83d\udce7 *Email:* {{ $('Switch').item.json.sender_email }}\n\ud83c\udfe0 *Property:* {{ $('Switch').item.json.property_reference || \"Not specified\" }}\n\ud83d\udcdd *Subject:* {{ $('Switch').item.json.original_subject }}\n\n\ud83d\udcac *Details:*\n\"{{ $('Switch').item.json.original_body }}\"\n\n\ud83d\udd25 *Urgency:* {{ $('Switch').item.json.urgency }}\n\n\ud83e\udd16 *AI Suggested Reply:*\n\"{{ $('Switch').item.json.suggested_reply }}\"\n\n\u2705 *Status:* AI reply draft saved in Gmail. Please review and send.",
+        "otherOptions": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.4,
+      "position": [
+        80,
+        880
+      ],
+      "id": "",
+      "name": "Notify Maintenance Team",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list",
+          "cachedResultName": "tenant-query"
+        },
+        "text": "=\ud83d\udccb *New Tenant Query \u2014 Action Required*\n\n\ud83d\udc64 *Name:* {{ $('Switch').item.json.sender_name }}\n\ud83d\udce7 *Email:* {{ $('Switch').item.json.sender_email }}\n\ud83c\udfe0 *Property:* {{ $('Switch').item.json.property_reference || \"Not specified\" }}\n\ud83d\udcdd *Subject:* {{ $('Switch').item.json.original_subject }}\n\n\ud83d\udcac *Message:* \n\"{{ $('Switch').item.json.original_body }}\"\n\n\ud83e\udd16 *AI Suggested Reply:*\n\"{{ $('Switch').item.json.suggested_reply }}\"\n\n\u2705 *Status:* AI reply draft saved in Gmail. Please review and send.",
+        "otherOptions": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.4,
+      "position": [
+        80,
+        1056
+      ],
+      "id": "",
+      "name": "Notify Tenant Relations Team",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list",
+          "cachedResultName": "viewing"
+        },
+        "text": "=\ud83d\udcc5 *New Viewing Request*\n\n\ud83d\udc64 *Name:* {{ $('Switch').item.json.sender_name }}\n\ud83d\udce7 *Email:* {{ $('Switch').item.json.sender_email }}\n\ud83c\udfe0 *Property:* {{ $('Switch').item.json.property_reference || \"Not specified\" }}\n\ud83d\udcdd *Subject:* {{ $('Switch').item.json.original_subject }}\n\n\ud83d\udcac *Request Details:* \n\"{{ $('Switch').item.json.original_body }}\"\n\n\ud83e\udd16 *AI Suggested Reply:*\n\"{{ $('Switch').item.json.suggested_reply }}\"\n\n\u2705 *Status:* AI reply draft saved in Gmail. Please review and send.",
+        "otherOptions": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.4,
+      "position": [
+        80,
+        1216
+      ],
+      "id": "",
+      "name": "Notify Viewings Team",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list",
+          "cachedResultName": "enquiry"
+        },
+        "text": "=\ud83c\udfe1 *New Property Enquiry*\n\n\ud83d\udc64 *Name:* {{ $('Switch').item.json.sender_name }}\n\ud83d\udce7 *Email:* {{ $('Switch').item.json.sender_email }}\n\ud83c\udfe0 *Property:* {{ $('Switch').item.json.property_reference || \"Not specified\" }}\n\ud83d\udcdd *Subject:* {{ $('Switch').item.json.original_subject }}\n\n\ud83d\udcac *Enquiry:* \n\"{{ $('Switch').item.json.original_body }}\"\n\n\ud83e\udd16 *AI Suggested Reply:*\n\"{{ $('Switch').item.json.suggested_reply }}\"\n\n\u2705 *Status:* AI reply draft saved in Gmail. Please review and send.",
+        "otherOptions": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.4,
+      "position": [
+        80,
+        1408
+      ],
+      "id": "",
+      "name": "Notify Enquiries Team",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list",
+          "cachedResultName": "manual-review"
+        },
+        "text": "=\u26a0\ufe0f *Unclassified Ticket \u2014 Manual Review Required*\n\n\ud83d\udc64 *Name:* {{ $('Switch').item.json.sender_name }}\n\ud83d\udce7 *Email:* {{ $('Switch').item.json.sender_email }}\n\ud83c\udfe0 *Property:* {{ $('Switch').item.json.property_reference || \"Not specified\" }}\n\ud83d\udcdd *Subject:* {{ $('Switch').item.json.original_subject }}\n\n\ud83d\udcac *Message:* \n\"{{ $('Switch').item.json.original_body }}\"\n\n\u2705 *Action:* Routed to human review \u2014 AI could not confidently classify this ticket.",
+        "otherOptions": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.4,
+      "position": [
+        80,
+        1616
+      ],
+      "id": "",
+      "name": "Notify Manual Review Team",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Spam is not routed to any human team \u2014 this just passes the item through\n// so it can be logged to the backup sheet for audit purposes, then the branch ends.\nreturn items;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1248,
+        1520
+      ],
+      "id": "",
+      "name": "Log Spam & Ignore"
+    },
+    {
+      "parameters": {
+        "resource": "draft",
+        "subject": "=Re: {{ $('Switch').item.json.original_subject }}",
+        "emailType": "html",
+        "message": "=<p style=\"font-family: Arial, sans-serif; font-size: 14px; color: #333; line-height: 1.6; white-space: pre-line;\">\n{{ $('Switch').item.json.suggested_reply }}\n</p>",
+        "options": {
+          "sendTo": "={{ $('Switch').item.json.sender_email }}"
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        368,
+        1216
+      ],
+      "id": "",
+      "name": "Draft Customer Reply"
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "base": {
+          "__rl": true,
+          "value": "",
+          "mode": "list",
+          "cachedResultName": "",
+          "cachedResultUrl": ""
+        },
+        "table": {
+          "__rl": true,
+          "value": "",
+          "mode": "list",
+          "cachedResultName": "Table 1",
+          "cachedResultUrl": ""
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Urgency": "={{ $('Switch').item.json.urgency }}",
+            "Subject": "={{ $('Switch').item.json.original_subject }}",
+            "Body": "={{ $('Switch').item.json.original_body }}",
+            "Category": "={{ $('Switch').item.json.category }}",
+            "Name": "={{ $('Switch').item.json.sender_name }}",
+            "Property Reference": "={{ $('Switch').item.json.property_reference }}",
+            "Draft": "={{ $('Switch').item.json.suggested_reply }}",
+            "Ticket ID": "={{ $now.toFormat('yyyyMMddHHmmss') }}",
+            "Sender Email": "={{ $('Switch').item.json.sender_email }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Name",
+              "displayName": "Name",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Ticket ID",
+              "displayName": "Ticket ID",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Sender Email",
+              "displayName": "Sender Email",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Subject",
+              "displayName": "Subject",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Category",
+              "displayName": "Category",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "Maintenance",
+                  "value": "Maintenance"
+                },
+                {
+                  "name": "Tenant Query",
+                  "value": "Tenant Query"
+                },
+                {
+                  "name": "Viewing",
+                  "value": "Viewing"
+                },
+                {
+                  "name": "Enquiry",
+                  "value": "Enquiry"
+                },
+                {
+                  "name": "manual_review",
+                  "value": "manual_review"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Urgency",
+              "displayName": "Urgency",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "Low",
+                  "value": "Low"
+                },
+                {
+                  "name": "Medium",
+                  "value": "Medium"
+                },
+                {
+                  "name": "High",
+                  "value": "High"
+                },
+                {
+                  "name": "Critical",
+                  "value": "Critical"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Body",
+              "displayName": "Body",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Draft",
+              "displayName": "Draft",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Property Reference",
+              "displayName": "Property Reference",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Created Time",
+              "displayName": "Created Time",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.2,
+      "position": [
+        624,
+        1216
+      ],
+      "id": "",
+      "name": "Save Ticket to Airtable",
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "sendTo": "",
+        "subject": "=\ud83d\udea8 Support Ticket Processed: {{ $('Switch').item.json.original_subject }}",
+        "message": "=<div style=\"font-family: Arial, sans-serif; font-size: 14px; color: #333; line-height: 1.6; max-width: 600px; border: 1px solid #ddd; padding: 20px; border-radius: 8px;\">\n  <h2 style=\"color: #1a73e8; margin-top: 0; border-bottom: 2px solid #1a73e8; padding-bottom: 8px;\">\ud83e\udd16 Ticket Processing Complete</h2>\n  <p>A new support ticket has been successfully categorized, logged to Airtable, and drafted in Gmail.</p>\n  <table style=\"width: 100%; border-collapse: collapse; margin: 15px 0;\">\n    <tr style=\"background-color: #f9f9f9;\"><td style=\"padding: 8px; font-weight: bold; width: 140px;\">Sender Name:</td><td style=\"padding: 8px;\">{{ $('Switch').item.json.sender_name }}</td></tr>\n    <tr><td style=\"padding: 8px; font-weight: bold;\">Sender Email:</td><td style=\"padding: 8px;\">{{ $('Switch').item.json.sender_email }}</td></tr>\n    <tr style=\"background-color: #f9f9f9;\"><td style=\"padding: 8px; font-weight: bold;\">Category:</td><td style=\"padding: 8px; text-transform: uppercase; color: #d93025; font-weight: bold;\">{{ $('Switch').item.json.category }}</td></tr>\n    <tr><td style=\"padding: 8px; font-weight: bold;\">Property:</td><td style=\"padding: 8px;\">{{ $('Switch').item.json.property_reference || \"Not specified\" }}</td></tr>\n    <tr style=\"background-color: #f9f9f9;\"><td style=\"padding: 8px; font-weight: bold;\">Urgency:</td><td style=\"padding: 8px;\">{{ $('Switch').item.json.urgency }}</td></tr>\n  </table>\n  <div style=\"background-color: #f1f3f4; padding: 12px; border-radius: 4px; margin-top: 15px;\">\n    <strong style=\"display: block; margin-bottom: 5px;\">Original Message:</strong>\n    <span style=\"font-style: italic;\">\"{{ $('Switch').item.json.original_body }}\"</span>\n  </div>\n  <div style=\"background-color: #e8f0fe; padding: 12px; border-radius: 4px; margin-top: 15px; border-left: 4px solid #1a73e8;\">\n    <strong style=\"display: block; margin-bottom: 5px; color: #1a73e8;\">AI Draft Created:</strong>\n    <span style=\"white-space: pre-line;\">{{ $('Switch').item.json.suggested_reply }}</span>\n  </div>\n  <p style=\"font-size: 12px; color: #666; margin-top: 20px; border-top: 1px solid #ddd; padding-top: 10px;\">This is an automated notification from your n8n AI Agent. No action required unless manual review is triggered.</p>\n</div>",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        896,
+        976
+      ],
+      "id": "",
+      "name": "Notify Me \u2014 Ticket Processed"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "",
+          "mode": "url"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "id",
+          "value": "gid=0"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Name": "={{ $('Switch').item.json.sender_name }}",
+            "Sender": "={{ $('Switch').item.json.sender_email }}",
+            "Subject": "={{ $('Switch').item.json.original_subject }}",
+            "Category": "={{ $('Switch').item.json.category }}",
+            "Urgency": "={{ $('Switch').item.json.urgency }}",
+            "Body": "={{ $('Switch').item.json.original_body }}",
+            "Draft": "={{ $('Switch').item.json.suggested_reply }}",
+            "Created Time": "={{ $now.toISO() }}",
+            "Property Reference": "={{ $('Switch').item.json.property_reference }}"
+          },
+          "matchingColumns": [
+            "Email"
+          ],
+          "schema": [
+            {
+              "id": "Name",
+              "displayName": "Name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Sender",
+              "displayName": "Sender",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Subject",
+              "displayName": "Subject",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Category",
+              "displayName": "Category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Urgency",
+              "displayName": "Urgency",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Body",
+              "displayName": "Body",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Draft",
+              "displayName": "Draft",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Created Time",
+              "displayName": "Created Time",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Property Reference",
+              "displayName": "Property Reference",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "cellFormat": "USER_ENTERED"
+        }
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        896,
+        1232
+      ],
+      "id": "",
+      "name": "Save Ticket to Backup Sheet"
+    },
+    {
+      "parameters": {
+        "sendTo": "",
+        "subject": "=\u26a0\ufe0f [Airtable Failed] Support Ticket Processed: {{ $('Switch').item.json.original_subject }}",
+        "message": "=<div style=\"font-family: Arial, sans-serif; font-size: 14px; color: #333; line-height: 1.6; max-width: 600px; border: 1px solid #d93025; padding: 20px; border-radius: 8px;\">\n  <h2 style=\"color: #d93025; margin-top: 0; border-bottom: 2px solid #d93025; padding-bottom: 8px;\">\u26a0\ufe0f Airtable Down - Google Sheets Backup Used</h2>\n  <p><strong>Notice:</strong> Airtable was unreachable. The ticket has been safely logged into the <strong>Google Sheets Backup</strong>, and a draft has been created in Gmail.</p>\n  <table style=\"width: 100%; border-collapse: collapse; margin: 15px 0;\">\n    <tr style=\"background-color: #f9f9f9;\"><td style=\"padding: 8px; font-weight: bold; width: 140px;\">Sender Name:</td><td style=\"padding: 8px;\">{{ $('Switch').item.json.sender_name }}</td></tr>\n    <tr><td style=\"padding: 8px; font-weight: bold;\">Sender Email:</td><td style=\"padding: 8px;\">{{ $('Switch').item.json.sender_email }}</td></tr>\n    <tr style=\"background-color: #f9f9f9;\"><td style=\"padding: 8px; font-weight: bold;\">Category:</td><td style=\"padding: 8px; text-transform: uppercase; color: #d93025; font-weight: bold;\">{{ $('Switch').item.json.category }}</td></tr>\n    <tr><td style=\"padding: 8px; font-weight: bold;\">Property:</td><td style=\"padding: 8px;\">{{ $('Switch').item.json.property_reference || \"Not specified\" }}</td></tr>\n    <tr style=\"background-color: #f9f9f9;\"><td style=\"padding: 8px; font-weight: bold;\">Urgency:</td><td style=\"padding: 8px;\">{{ $('Switch').item.json.urgency }}</td></tr>\n  </table>\n  <div style=\"background-color: #f1f3f4; padding: 12px; border-radius: 4px; margin-top: 15px;\">\n    <strong style=\"display: block; margin-bottom: 5px;\">Original Message:</strong>\n    <span style=\"font-style: italic;\">\"{{ $('Switch').item.json.original_body }}\"</span>\n  </div>\n  <div style=\"background-color: #e8f0fe; padding: 12px; border-radius: 4px; margin-top: 15px; border-left: 4px solid #1a73e8;\">\n    <strong style=\"display: block; margin-bottom: 5px; color: #1a73e8;\">AI Draft Created:</strong>\n    <span style=\"white-space: pre-line;\">{{ $('Switch').item.json.suggested_reply }}</span>\n  </div>\n  <p style=\"font-size: 11px; color: #666; margin-top: 20px; border-top: 1px solid #ddd; padding-top: 10px;\">SYSTEM NOTICE: Airtable API error occurred. Database admin attention may be required.</p>\n</div>",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        1136,
+        1232
+      ],
+      "id": "",
+      "name": "Notify Me \u2014 Airtable Failed"
+    }
+  ],
+  "connections": {
+    "Email Trigger (IMAP)": {
+      "main": [
+        [
+          {
+            "node": "Sanitize Email Body",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Email Body": {
+      "main": [
+        [
+          {
+            "node": "Classify Ticket via Groq",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Ticket via Groq": {
+      "main": [
+        [
+          {
+            "node": "Parse Classification & Sender",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Handle Classification Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Classification & Sender": {
+      "main": [
+        [
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Handle Classification Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Handle Classification Error": {
+      "main": [
+        [
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch": {
+      "main": [
+        [
+          {
+            "node": "Notify Maintenance Team",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Tenant Relations Team",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Viewings Team",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Enquiries Team",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Spam & Ignore",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Manual Review Team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Maintenance Team": {
+      "main": [
+        [
+          {
+            "node": "Draft Customer Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Tenant Relations Team": {
+      "main": [
+        [
+          {
+            "node": "Draft Customer Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Viewings Team": {
+      "main": [
+        [
+          {
+            "node": "Draft Customer Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Enquiries Team": {
+      "main": [
+        [
+          {
+            "node": "Draft Customer Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Manual Review Team": {
+      "main": [
+        [
+          {
+            "node": "Draft Customer Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Spam & Ignore": {
+      "main": [
+        [
+          {
+            "node": "Save Ticket to Backup Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft Customer Reply": {
+      "main": [
+        [
+          {
+            "node": "Save Ticket to Airtable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Ticket to Airtable": {
+      "main": [
+        [
+          {
+            "node": "Notify Me \u2014 Ticket Processed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Save Ticket to Backup Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Ticket to Backup Sheet": {
+      "main": [
+        [
+          {
+            "node": "Notify Me \u2014 Airtable Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}
