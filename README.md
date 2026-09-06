@@ -28,7 +28,7 @@ A workflow that runs without errors isn't the same as a workflow that behaves co
 
 ## Files in This Repo
 
-- `Property-Support-Ticket-Classifier.json`, the full exportable n8n workflow. Import it directly into your own n8n instance.
+- `Property Inbox AI Classifier.json`, the full exportable n8n workflow. Import it directly into your own n8n instance.
 - `Property Inbox AI Classifier.png`, a visual diagram of the workflow.
 - `README.md`, this file.
 
